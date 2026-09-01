@@ -1,0 +1,15 @@
+# NOTE: this file is NOT used by the Docker image — Caddy is not installed
+# and nothing in Dockerfile/scripts/start.sh references it. It's kept here
+# only as an optional reverse-proxy config for people who want to run Caddy
+# in front of the app themselves (outside Coolify, which does its own
+# proxying). Only wire this in if you actually run Caddy — and if you do,
+# make sure it (not the app) is the very first hop from the internet, so
+# the X-Forwarded-For it sets below can be trusted.
+:81 {
+	reverse_proxy localhost:3001 {
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
+	}
+}

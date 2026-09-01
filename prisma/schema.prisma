@@ -1,0 +1,257 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enum Types ──────────────────────────────────────────────────────
+
+/// User role for access control
+enum UserRole {
+  user
+  admin
+}
+
+/// Subscription plan
+enum Plan {
+  free
+  pro
+  enterprise
+}
+
+/// Post scheduling/publishing status lifecycle
+enum PostStatus {
+  pending       // Initial state, awaiting scheduling
+  scheduled     // Queued for future publishing (in BullMQ)
+  processing    // Currently being published by worker
+  published     // Successfully published to LinkedIn
+  failed        // Publish failed (with error details)
+}
+
+/// CSV upload processing status
+enum CsvUploadStatus {
+  processing
+  completed
+  failed
+}
+
+/// Schedule state for pausing/resuming bulk uploads
+enum ScheduleState {
+  active
+  paused
+  off
+}
+
+/// Payment status lifecycle:
+/// pending          — USDT payment submitted, awaiting on-chain verification
+/// pending_manual   — Manual payment (Binance) submitted, awaiting admin review
+/// verified         — Payment confirmed, plan activated
+/// rejected         — Admin rejected the payment proof
+/// refunded         — Payment refunded to user
+enum PaymentStatus {
+  pending
+  pending_manual
+  verified
+  rejected
+  refunded
+}
+
+// ─── Models ──────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  name      String?
+  email     String   @unique
+  password  String?
+  role      UserRole @default(user)
+  plan      Plan     @default(free)
+  // ─── Subscription expiry ─────────────────────────────────────────
+  // When a paid plan (Pro / Enterprise) is activated via payment
+  // verification, this is set to (now + 30 days). When it expires, the
+  // user's EFFECTIVE plan reverts to 'free' (enforced by
+  // src/lib/plan-helpers.ts getEffectivePlan). The user can renew by
+  // buying the plan again — each renewal EXTENDS the expiry by 30 days
+  // from the current expiry (or from now, whichever is later).
+  // NULL for free-plan users (no expiry — free is perpetual).
+  planExpiresAt DateTime?
+  // Track the last time a renewal payment was recorded, for audit.
+  planRenewedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  linkedinAccounts     LinkedinAccount[]
+  accountConnectionLogs AccountConnectionLog[]
+  posts                Post[]
+  csvUploads           CsvUpload[]
+  passwordResetTokens  PasswordResetToken[]
+  payments             Payment[]
+  apiUsageLogs         ApiUsageLog[]
+
+  @@index([email])
+}
+
+/// Append-only log of every LinkedIn account ever connected by a user.
+///
+/// PURPOSE: prevents account-cycling abuse. Without this, a Pro user (25-account
+/// limit) could connect 25 accounts, disconnect them all, connect 25 NEW accounts,
+/// disconnect, connect 25 more... cycling through unlimited accounts to post at
+/// scale far beyond their plan's monthly capacity.
+///
+/// ENFORCEMENT: when a user tries to connect a new LinkedIn account, we count
+/// DISTINCT linkedinMemberIds in this table for that user. If the distinct
+/// count >= plan.maxAccounts AND the new linkedinMemberId is NOT already in
+/// the log, we reject the connection (403). Reconnecting a previously-connected
+/// account (same linkedinMemberId already in log) is always allowed.
+///
+/// This table is NEVER deleted from — it's an audit trail. Even if the user
+/// disconnects the account (hard-deletes LinkedinAccount row), the log entry
+/// persists so the unique-count stays accurate.
+model AccountConnectionLog {
+  id               String   @id @default(cuid())
+  userId           String
+  linkedinMemberId String
+  /// The linkedinMemberId at the time of connection (for audit). If the user
+  /// reconnects the same account, a new row is inserted (so we can also see
+  /// connection frequency / abuse patterns).
+  accountName      String?
+  connectedAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, linkedinMemberId, connectedAt])
+  @@index([userId])
+  @@index([userId, linkedinMemberId])
+  @@index([connectedAt])
+}
+
+model LinkedinAccount {
+  id               String   @id @default(cuid())
+  userId           String
+  linkedinMemberId String
+  accountName      String
+  accessToken      String
+  refreshToken     String?
+  tokenExpiresAt   DateTime?
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  posts       Post[]
+  apiUsageLogs ApiUsageLog[]
+
+  @@index([userId])
+  @@index([linkedinMemberId])
+}
+
+model Post {
+  id           String     @id @default(cuid())
+  userId       String
+  accountId    String
+  caption      String
+  imageUrl     String?
+  videoUrl     String?
+  comment      String?
+  status       PostStatus @default(pending)
+  scheduledAt  DateTime?  // When the post was added to BullMQ queue
+  publishTime  DateTime?  // When the post should be published
+  error        String?
+  csvUploadId  String?
+  linkedinPostUrn String?
+  retryCount   Int        @default(0) // Number of retry attempts
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account    LinkedinAccount   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  csvUpload  CsvUpload?       @relation(fields: [csvUploadId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([accountId])
+  @@index([status, publishTime]) // Compound index for scheduler queries
+  @@index([csvUploadId])
+  @@index([scheduledAt])
+}
+
+model CsvUpload {
+  id            String         @id @default(cuid())
+  userId        String
+  accountId     String         @default("")
+  filename      String
+  totalPosts    Int
+  intervalValue Int            @default(0)
+  intervalUnit  String         @default("minute")
+  status        CsvUploadStatus @default(processing)
+  scheduleState ScheduleState  @default(active)
+  createdAt     DateTime       @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  posts Post[]
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+
+  // ─── Current OTP (one active code per user at a time) ──────────────────
+  codeHash  String?             // bcrypt hash of the 6-digit code — never store plaintext
+  expiresAt DateTime?           // code is valid for 15 minutes from send time
+  used      Boolean  @default(false)
+  attempts  Int      @default(0) // failed verification attempts against the current code
+
+  // ─── 24h send-window tracking (max 3 codes / user / 24h) ───────────────
+  sendCount   Int      @default(0)
+  windowStart DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  userId        String
+  method        String
+  amount        Float
+  txHash        String?
+  transactionId String?
+  status        PaymentStatus @default(pending)
+  plan          String
+  verifiedAt    DateTime?
+  verifiedBy    String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+/// Per-call audit log of every LinkedIn API call made by this user.
+/// Used to enforce the 150-calls / 24-hour LinkedIn API safety limit.
+model ApiUsageLog {
+  id        String   @id @default(cuid())
+  userId    String
+  /// Which connected LinkedIn account this call was made on behalf of.
+  accountId String?
+  endpoint  String
+  method    String   @default("GET")
+  status    Int      @default(200)
+  createdAt DateTime @default(now())
+
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account LinkedinAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([accountId])
+  @@index([userId, accountId])
+  @@index([createdAt])
+  @@index([endpoint])
+}

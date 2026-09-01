@@ -1,0 +1,25 @@
+node_modules
+.next
+.git
+*.log
+dev.log
+server.log
+npm-debug.log*
+
+# Local SQLite databases — never bake these into an image
+prisma/*.db
+prisma/*.db-journal
+prisma/dev.db
+
+# Local env — Coolify/Docker inject real env vars separately
+.env
+.env.local
+
+# Editor/OS cruft
+.vscode
+.idea
+.DS_Store
+
+# Docs not needed inside the image
+README.md
+LOCAL_SETUP.md

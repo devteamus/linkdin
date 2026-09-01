@@ -1,0 +1,216 @@
+# PostGo — docker-compose.yml (Coolify-compatible)
+#
+# NOTE FOR COOLIFY:
+#   - Do NOT publish postgres/redis ports to the host. Services talk to each
+#     other over the internal compose network (`postgo-network`).
+#   - Do NOT set container_name — Coolify manages container names and fixed
+#     names cause conflicts on redeploy / multi-instance deployments.
+#   - `env_file` is optional: Coolify injects env vars defined in the UI,
+#     and locally you create .env from .env.example.
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # No host port mapping — postgres stays internal to the compose network.
+    # (Local dev access: `docker compose exec postgres psql -U postgo`)
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgo_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-postgo}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c work_mem=4MB
+        -c min_wal_size=1GB
+        -c max_wal_size=4GB
+        -c max_worker_processes=8
+        -c max_parallel_workers_per_gather=4
+        -c max_parallel_workers=8
+        -c pg_stat_statements.track=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgo} -d ${POSTGRES_DB:-postgo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - postgo-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # No host port mapping — redis stays internal (it has no password,
+    # so exposing it publicly would be a critical security hole).
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+        --appendfsync everysec
+        --save 60 1000
+        --save 300 100
+        --tcp-backlog 1024
+        --tcp-keepalive 60
+        --timeout 0
+        --client-output-buffer-limit normal 32mb 16mb 60
+        --client-output-buffer-limit replica 64mb 32mb 120
+        --client-output-buffer-limit pubsub 32mb 8mb 60
+        --hz 20
+        --dynamic-hz yes
+        --rdbcompression yes
+        --rdbchecksum yes
+        --activedefrag yes
+        --active-defrag-threshold-lower 10
+        --active-defrag-threshold-upper 100
+        --active-defrag-cycle-min 1
+        --active-defrag-cycle-max 25
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - postgo-network
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USDT_WALLET_ADDRESS: ${NEXT_PUBLIC_USDT_WALLET_ADDRESS:-}
+    restart: unless-stopped
+    # Coolify: map a domain to this service in the UI, or reach it via
+    # VPS_IP:3001. Locally: http://localhost:3001
+    ports:
+      - "3001:3001"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      HOSTNAME: "0.0.0.0"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgo}:${POSTGRES_PASSWORD:-postgo_secret}@postgres:5432/${POSTGRES_DB:-postgo}?connection_limit=30&pool_timeout=30&connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3001/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - postgo-network
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USDT_WALLET_ADDRESS: ${NEXT_PUBLIC_USDT_WALLET_ADDRESS:-}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgo}:${POSTGRES_PASSWORD:-postgo_secret}@postgres:5432/${POSTGRES_DB:-postgo}?connection_limit=20&pool_timeout=30&connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      WORKER_ID: worker-1
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
+      LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
+      LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
+    entrypoint: []
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - postgo-network
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USDT_WALLET_ADDRESS: ${NEXT_PUBLIC_USDT_WALLET_ADDRESS:-}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgo}:${POSTGRES_PASSWORD:-postgo_secret}@postgres:5432/${POSTGRES_DB:-postgo}?connection_limit=20&pool_timeout=30&connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      WORKER_ID: worker-2
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
+      LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
+      LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
+    entrypoint: []
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - postgo-network
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_USDT_WALLET_ADDRESS: ${NEXT_PUBLIC_USDT_WALLET_ADDRESS:-}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgo}:${POSTGRES_PASSWORD:-postgo_secret}@postgres:5432/${POSTGRES_DB:-postgo}?connection_limit=20&pool_timeout=30&connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      WORKER_ID: worker-3
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
+      LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
+      LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
+    entrypoint: []
+    command: ["npm", "run", "worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - postgo-network
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  postgo-network:
+    driver: bridge
