@@ -139,7 +139,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
       LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
-    entrypoint: []
+    entrypoint: ""
     command: ["npm", "run", "worker"]
     depends_on:
       postgres:
@@ -167,7 +167,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
       LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
-    entrypoint: []
+    entrypoint: ""
     command: ["npm", "run", "worker"]
     depends_on:
       postgres:
@@ -195,7 +195,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-25}
       LINKEDIN_RATE_LIMIT_MAX: ${LINKEDIN_RATE_LIMIT_MAX:-100}
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
-    entrypoint: []
+    entrypoint: ""
     command: ["npm", "run", "worker"]
     depends_on:
       postgres:
