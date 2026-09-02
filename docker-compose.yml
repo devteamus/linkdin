@@ -141,6 +141,8 @@ services:
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
     entrypoint: ""
     command: ["npm", "run", "worker"]
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,6 +171,8 @@ services:
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
     entrypoint: ""
     command: ["npm", "run", "worker"]
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -197,6 +201,8 @@ services:
       LINKEDIN_RATE_LIMIT_WINDOW_MS: ${LINKEDIN_RATE_LIMIT_WINDOW_MS:-60000}
     entrypoint: ""
     command: ["npm", "run", "worker"]
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy
