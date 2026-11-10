@@ -55,6 +55,8 @@ import {
   type CsvUploadDetail,
   type CsvUploadPost,
   type CsvUploadSummary,
+  type AccountHistoryResponse,
+  type AccountHistoryPost,
   ApiError,
 } from '@/lib/api';
 
@@ -154,6 +156,7 @@ const NAV_ITEMS = [
   { id: 'bulk-post' as const, label: 'Bulk Post', icon: FileSpreadsheet },
   { id: 'history' as const, label: 'History', icon: History },
   { id: 'csv-history' as const, label: 'CSV History', icon: HistoryIcon },
+  { id: 'account-history' as const, label: 'Account History', icon: Clock },
   { id: 'upgrade' as const, label: 'Upgrade', icon: Crown },
 ];
 
@@ -164,6 +167,7 @@ const TAB_TITLES: Record<string, string> = {
   'bulk-post': 'Bulk Upload',
   history: 'Post History',
   'csv-history': 'CSV Upload History',
+  'account-history': 'Account History',
   'upgrade': 'Upgrade Plan',
 };
 
@@ -207,7 +211,7 @@ function StatCard({
 // ─── SidebarContent (shared desktop/mobile) ────────────────────────
 
 function SidebarContent({ onSelectTab, onLogout, currentTab }: {
-  onSelectTab: (tab: 'overview' | 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'upgrade') => void;
+  onSelectTab: (tab: 'overview' | 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'account-history' | 'upgrade') => void;
   onLogout: () => void;
   currentTab: string;
 }) {
@@ -254,7 +258,7 @@ function SidebarContent({ onSelectTab, onLogout, currentTab }: {
 
 // ─── OverviewTab ───────────────────────────────────────────────────
 
-function OverviewTab({ onSwitchTab }: { onSwitchTab: (tab: 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'upgrade') => void }) {
+function OverviewTab({ onSwitchTab }: { onSwitchTab: (tab: 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'account-history' | 'upgrade') => void }) {
   const stats = useAppStore((s) => s.stats);
   const isLoadingStats = useAppStore((s) => s.isLoadingStats);
   const apiUsage = useAppStore((s) => s.apiUsage);
@@ -2897,6 +2901,323 @@ function UpgradePaymentForm({
   );
 }
 
+// ─── AccountHistoryTab (NEW — account-wise publish history) ─────────
+// Per-account view: pick one LinkedIn account and see every CSV batch
+// uploaded to it, how many posts are already published vs scheduled,
+// the exact publish time of the NEXT post, and each upload's posts in
+// original CSV serial order (#1 = first CSV row).
+
+function AccountHistoryTab() {
+  const accounts = useAppStore((s) => s.accounts);
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [history, setHistory] = useState<AccountHistoryResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [openUploadId, setOpenUploadId] = useState<string | null>(null);
+  const [postsDetail, setPostsDetail] = useState<AccountHistoryPost[] | null>(null);
+  const [loadingPosts, setLoadingPosts] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  // Auto-select the first account once accounts load
+  useEffect(() => {
+    if (!selectedAccountId && accounts.length > 0) {
+      setSelectedAccountId(accounts[0].id);
+    }
+  }, [accounts, selectedAccountId]);
+
+  const loadHistory = async (accountId: string) => {
+    setLoading(true);
+    try {
+      const h = await api.getAccountHistory(accountId);
+      setHistory(h);
+    } catch {
+      toast.error('Failed to load account history');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Load history when the selected account changes
+  useEffect(() => {
+    if (selectedAccountId) {
+      setOpenUploadId(null);
+      setPostsDetail(null);
+      loadHistory(selectedAccountId);
+    }
+  }, [selectedAccountId]);
+
+  // Auto-refresh the overview every 15s so published counts and the
+  // next-post time stay live while the scheduler works through a CSV.
+  useEffect(() => {
+    if (!selectedAccountId) return;
+    const interval = setInterval(() => loadHistory(selectedAccountId), 15000);
+    return () => clearInterval(interval);
+  }, [selectedAccountId]);
+
+  async function toggleUpload(uploadId: string) {
+    if (openUploadId === uploadId) {
+      setOpenUploadId(null);
+      setPostsDetail(null);
+      return;
+    }
+    setOpenUploadId(uploadId);
+    setPostsDetail(null);
+    setStatusFilter('all');
+    setLoadingPosts(true);
+    try {
+      const res = await api.getAccountHistoryPosts(selectedAccountId, uploadId);
+      setPostsDetail(res.posts);
+    } catch {
+      toast.error('Failed to load posts for this upload');
+    } finally {
+      setLoadingPosts(false);
+    }
+  }
+
+  const filteredPosts = postsDetail
+    ? statusFilter === 'all'
+      ? postsDetail
+      : postsDetail.filter((p) => p.status === statusFilter)
+    : null;
+
+  const nextPost = history?.nextPost;
+  const minutesUntilNext = nextPost?.publishTime
+    ? Math.max(0, Math.round((new Date(nextPost.publishTime).getTime() - Date.now()) / 60000))
+    : null;
+  const selectedAccount = accounts.find((a) => a.id === selectedAccountId);
+
+  return (
+    <div className="space-y-6">
+      {/* Account selector */}
+      <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+        <div className="w-full sm:w-72">
+          <Label className="text-xs text-muted-foreground mb-1.5">LinkedIn account</Label>
+          <Select value={selectedAccountId} onValueChange={setSelectedAccountId}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Select an account" />
+            </SelectTrigger>
+            <SelectContent>
+              {accounts.map((acc) => (
+                <SelectItem key={acc.id} value={acc.id}>
+                  {acc.accountName}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {selectedAccount && (
+          <Badge variant={selectedAccount.isActive ? 'outline' : 'destructive'}>
+            {selectedAccount.isActive ? 'Active' : 'Inactive'}
+          </Badge>
+        )}
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Card className="bg-card rounded-xl">
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Published</p>
+            {loading ? (
+              <Skeleton className="h-7 w-16 mt-1" />
+            ) : (
+              <p className="text-2xl font-bold mt-1">{history?.totals.published ?? 0}</p>
+            )}
+          </CardContent>
+        </Card>
+        <Card className="bg-card rounded-xl">
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Scheduled</p>
+            {loading ? (
+              <Skeleton className="h-7 w-16 mt-1" />
+            ) : (
+              <p className="text-2xl font-bold mt-1">{history?.totals.scheduled ?? 0}</p>
+            )}
+          </CardContent>
+        </Card>
+        <Card className="bg-card rounded-xl">
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Failed</p>
+            {loading ? (
+              <Skeleton className="h-7 w-16 mt-1" />
+            ) : (
+              <p className="text-2xl font-bold mt-1 text-destructive">{history?.totals.failed ?? 0}</p>
+            )}
+          </CardContent>
+        </Card>
+        <Card className="bg-card rounded-xl border-[#0A66C2]/30">
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Next post</p>
+            {loading ? (
+              <Skeleton className="h-7 w-32 mt-1" />
+            ) : nextPost?.publishTime ? (
+              <div className="mt-1">
+                <p className="text-sm font-bold">{formatDate(nextPost.publishTime)}</p>
+                <p className="text-xs text-muted-foreground">
+                  in {minutesUntilNext} min — {truncate(nextPost.captionPreview, 40)}
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground mt-1">None scheduled</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Uploads (CSV batches for this account) */}
+      {loading && !history ? (
+        <div className="space-y-3">
+          {[1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-24 w-full rounded-xl" />
+          ))}
+        </div>
+      ) : history && history.uploads.length > 0 ? (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold">CSV Uploads ({history.uploads.length})</h3>
+          {history.uploads.map((u) => {
+            const isOpen = openUploadId === u.id;
+            return (
+              <Card key={u.id} className="rounded-xl">
+                <CardHeader className="pb-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <CardTitle className="text-base truncate">{u.filename}</CardTitle>
+                      <CardDescription>
+                        {u.totalPosts} posts · every {u.intervalValue} {u.intervalUnit}(s) · uploaded{' '}
+                        {formatDate(u.createdAt)}
+                      </CardDescription>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {u.scheduleState === 'active' ? (
+                        <Badge className="bg-green-600 text-white hover:bg-green-600">Active</Badge>
+                      ) : u.scheduleState === 'paused' ? (
+                        <Badge variant="outline" className="border-yellow-500 text-yellow-600 bg-yellow-50">
+                          Paused
+                        </Badge>
+                      ) : (
+                        <Badge variant="secondary">Off</Badge>
+                      )}
+                      <Button size="sm" variant="outline" onClick={() => toggleUpload(u.id)}>
+                        {isOpen ? 'Hide posts' : 'View posts (serial order)'}
+                      </Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <Badge className="bg-[#0A66C2] text-white hover:bg-[#0A66C2]">
+                      Published {u.counts.published}
+                    </Badge>
+                    <Badge variant="outline" className="border-blue-500 text-blue-600 bg-blue-50">
+                      Scheduled {u.counts.scheduled}
+                    </Badge>
+                    <Badge variant="outline" className="border-yellow-500 text-yellow-600 bg-yellow-50">
+                      Pending {u.counts.pending}
+                    </Badge>
+                    <Badge variant="outline">Processing {u.counts.processing}</Badge>
+                    {u.counts.failed > 0 && <Badge variant="destructive">Failed {u.counts.failed}</Badge>}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-muted-foreground">
+                    <p>
+                      <Clock className="h-3 w-3 inline mr-1" />
+                      First: {u.firstPublishAt ? formatDate(u.firstPublishAt) : '—'}
+                    </p>
+                    <p>
+                      <Timer className="h-3 w-3 inline mr-1" />
+                      Next: {u.nextPublishAt ? formatDate(u.nextPublishAt) : '—'}
+                    </p>
+                    <p>
+                      <CalendarClock className="h-3 w-3 inline mr-1" />
+                      Last: {u.lastPublishAt ? formatDate(u.lastPublishAt) : '—'}
+                    </p>
+                  </div>
+
+                  {isOpen && (
+                    <div className="pt-2">
+                      {loadingPosts ? (
+                        <div className="flex items-center justify-center py-8">
+                          <Loader2 className="h-6 w-6 animate-spin text-[#0A66C2]" />
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs text-muted-foreground">Filter:</span>
+                            {['all', 'published', 'scheduled', 'pending', 'processing', 'failed'].map((f) => (
+                              <button
+                                key={f}
+                                onClick={() => setStatusFilter(f)}
+                                className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors cursor-pointer ${
+                                  statusFilter === f
+                                    ? 'bg-[#0A66C2] text-white border-[#0A66C2]'
+                                    : 'bg-card text-muted-foreground hover:bg-muted'
+                                }`}
+                              >
+                                {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
+                              </button>
+                            ))}
+                            <span className="text-xs text-muted-foreground ml-auto">
+                              {filteredPosts ? `${filteredPosts.length} / ${postsDetail?.length ?? 0} posts` : ''}
+                            </span>
+                          </div>
+                          <div className="rounded-lg border overflow-x-auto max-h-[520px] overflow-y-auto">
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead className="w-16">Serial</TableHead>
+                                  <TableHead>Caption</TableHead>
+                                  <TableHead className="w-28">Status</TableHead>
+                                  <TableHead className="w-44">Publish time</TableHead>
+                                  <TableHead className="w-20">Retries</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {(filteredPosts ?? []).map((p) => (
+                                  <TableRow key={p.id} className={p.status === 'processing' ? 'bg-blue-50/50' : undefined}>
+                                    <TableCell className="font-mono text-xs text-muted-foreground">#{p.serial}</TableCell>
+                                    <TableCell className="max-w-[280px]">
+                                      <p className="text-sm truncate" title={p.captionPreview}>
+                                        {p.captionPreview}
+                                      </p>
+                                      {p.error && (
+                                        <p className="text-xs text-destructive truncate mt-0.5" title={p.error}>
+                                          {p.error}
+                                        </p>
+                                      )}
+                                    </TableCell>
+                                    <TableCell>{statusBadge(p.status)}</TableCell>
+                                    <TableCell className="text-xs text-muted-foreground">
+                                      {p.publishTime ? formatDate(p.publishTime) : '—'}
+                                    </TableCell>
+                                    <TableCell className="text-xs text-muted-foreground">
+                                      {p.retryCount > 0 ? p.retryCount : '—'}
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      ) : (
+        <Card className="rounded-xl">
+          <CardContent className="py-10 text-center">
+            <FileSpreadsheet className="h-10 w-10 mx-auto text-muted-foreground mb-3" />
+            <p className="text-sm text-muted-foreground">
+              No CSV uploads for this account yet. Upload a CSV from the Bulk Post tab — its full publish
+              history will appear here in serial order.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ─── Dashboard (main, default export) ───────────────────────────────
 
 export default function Dashboard() {
@@ -2918,7 +3239,7 @@ export default function Dashboard() {
     setView('landing');
   }
 
-  function handleSelectTab(tab: 'overview' | 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'upgrade') {
+  function handleSelectTab(tab: 'overview' | 'accounts' | 'create-post' | 'bulk-post' | 'history' | 'csv-history' | 'account-history' | 'upgrade') {
     setDashboardTab(tab);
     setMobileMenuOpen(false);
   }
@@ -2937,6 +3258,8 @@ export default function Dashboard() {
         return <HistoryTab />;
       case 'csv-history':
         return <CsvHistoryTab />;
+      case 'account-history':
+        return <AccountHistoryTab />;
       case 'upgrade':
         return <UpgradeTab />;
       default:

@@ -74,8 +74,13 @@ const QUEUE_OPTIONS = {
       delay: 5000, // Start with 5 seconds, then exponential
     },
     
-    // Job timeout - max time worker has to process one post
-    timeout: 120_000, // 2 minutes (accounts for media upload time)
+    // Job timeout - max time worker has to process one post.
+    // 240s (up from 120s): a video publish can make 3 rate-limited REST
+    // calls, each of which may legitimately wait out LinkedIn's
+    // Retry-After (up to 120s). The old 120s timeout killed such jobs
+    // mid-flight, leaving posts stuck in 'processing' and risking a
+    // duplicate publish on retry. Matches PER_POST_TIMEOUT_MS in worker.ts.
+    timeout: 240_000,
   },
 }
 

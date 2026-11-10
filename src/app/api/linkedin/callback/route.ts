@@ -111,65 +111,103 @@ export async function GET(request: NextRequest) {
       memberId = 'unknown'
     }
 
-    // ─── Plan-aware account connect limit (anti-cycling, respects expiry) ──
-    // Uses the EFFECTIVE plan — expired subscriptions revert to free limits.
-    const currentUser = await db.user.findUnique({
-      where: { id: userId },
-      select: { plan: true, planExpiresAt: true },
-    })
-    const rawPlan = (currentUser?.plan as Plan) || 'free'
-    const userPlan = getEffectivePlan(rawPlan, currentUser?.planExpiresAt ?? null)
-    const planLimits = getPlanLimits(userPlan)
-
-    // Check 1: active account count
-    const activeCount = await db.linkedinAccount.count({ where: { userId } })
-    if (activeCount >= planLimits.maxAccounts) {
-      console.warn(
-        `[linkedin-callback] User ${userId} (${userPlan}) at active limit ${activeCount}/${planLimits.maxAccounts} — rejecting`
-      )
-      return NextResponse.redirect(new URL('/?linkedin=limit', getAppBaseUrl()))
-    }
-
-    // Check 2: unique lifetime accounts (anti-cycling)
-    // Only block if the new memberId is NOT already in the connection log.
-    // If it IS in the log, this is a reconnection — always allow.
-    if (memberId && memberId !== 'unknown') {
-      const existingLog = await db.accountConnectionLog.findFirst({
-        where: { userId, linkedinMemberId: memberId },
-        select: { id: true },
-      })
-      if (!existingLog) {
-        // New account — check unique count
-        const uniqueResult = await db.$queryRaw<{ count: bigint }[]>`
-          SELECT COUNT(DISTINCT "linkedinMemberId")::bigint as count
-          FROM "AccountConnectionLog"
-          WHERE "userId" = ${userId}
-        `
-        const uniqueCount = Number(uniqueResult[0]?.count ?? 0)
-        if (uniqueCount >= planLimits.maxAccounts) {
-          console.warn(
-            `[linkedin-callback] User ${userId} (${userPlan}) at UNIQUE limit ${uniqueCount}/${planLimits.maxAccounts} — rejecting NEW account ${memberId}`
-          )
-          return NextResponse.redirect(new URL('/?linkedin=limit', getAppBaseUrl()))
-        }
-      }
-    }
+    // ─── Bug #1 fix: reconnect dedup BEFORE anything else ────────────
+    //
+    // The SAME LinkedIn account (same linkedinMemberId) previously created
+    // a NEW LinkedinAccount row on every connect — disconnect → connect →
+    // disconnect → connect each time. Every new row got a fresh local cuid
+    // `accountId`, and the old per-accountId rate limiter gave each of those
+    // rows its OWN 100/min bucket even though LinkedIn throttles by MEMBER
+    // identity — so reconnecting in a loop multiplied the real API traffic
+    // until LinkedIn 429'd, while the app's own limiter swore everything was
+    // under "its" limit. Reconnecting a known member now UPDATES the existing
+    // row (fresh token, re-activated) and never adds a duplicate.
+    const existingAccount =
+      memberId && memberId !== 'unknown'
+        ? await db.linkedinAccount.findFirst({
+            where: { userId, linkedinMemberId: memberId },
+            select: { id: true },
+          })
+        : null
 
     // Encrypt and store the access token
     const encryptedToken = encryptToken(accessToken)
     const encryptedRefresh = refreshToken ? encryptToken(refreshToken) : null
     const tokenExpiresAt = expiresIn ? new Date(Date.now() + expiresIn * 1000) : null
 
-    await db.linkedinAccount.create({
-      data: {
-        userId,
-        linkedinMemberId: memberId,
-        accountName: memberName,
-        accessToken: encryptedToken,
-        refreshToken: encryptedRefresh,
-        tokenExpiresAt,
-      },
-    })
+    if (existingAccount) {
+      // ─── Reconnect: refresh the existing row, never duplicate ──────
+      // Also re-activate it in case the user had marked it inactive.
+      await db.linkedinAccount.update({
+        where: { id: existingAccount.id },
+        data: {
+          accessToken: encryptedToken,
+          refreshToken: encryptedRefresh,
+          tokenExpiresAt,
+          accountName: memberName,
+          isActive: true,
+        },
+      })
+      console.log(
+        `[linkedin-callback] Reconnected existing account ${existingAccount.id} ` +
+        `(member ${memberId}) — token refreshed, no duplicate row`
+      )
+    } else {
+      // ─── Brand-new member for this user → enforce plan limits ──────
+      // Plan-aware account connect limit (anti-cycling, respects expiry).
+      // Uses the EFFECTIVE plan — expired subscriptions revert to free limits.
+      const currentUser = await db.user.findUnique({
+        where: { id: userId },
+        select: { plan: true, planExpiresAt: true },
+      })
+      const rawPlan = (currentUser?.plan as Plan) || 'free'
+      const userPlan = getEffectivePlan(rawPlan, currentUser?.planExpiresAt ?? null)
+      const planLimits = getPlanLimits(userPlan)
+
+      // Check 1: active account count
+      const activeCount = await db.linkedinAccount.count({ where: { userId } })
+      if (activeCount >= planLimits.maxAccounts) {
+        console.warn(
+          `[linkedin-callback] User ${userId} (${userPlan}) at active limit ${activeCount}/${planLimits.maxAccounts} — rejecting`
+        )
+        return NextResponse.redirect(new URL('/?linkedin=limit', getAppBaseUrl()))
+      }
+
+      // Check 2: unique lifetime accounts (anti-cycling)
+      // Only block if the new memberId is NOT already in the connection log.
+      if (memberId && memberId !== 'unknown') {
+        const existingLog = await db.accountConnectionLog.findFirst({
+          where: { userId, linkedinMemberId: memberId },
+          select: { id: true },
+        })
+        if (!existingLog) {
+          // New account — check unique count
+          const uniqueResult = await db.$queryRaw<{ count: bigint }[]>`
+            SELECT COUNT(DISTINCT "linkedinMemberId")::bigint as count
+            FROM "AccountConnectionLog"
+            WHERE "userId" = ${userId}
+          `
+          const uniqueCount = Number(uniqueResult[0]?.count ?? 0)
+          if (uniqueCount >= planLimits.maxAccounts) {
+            console.warn(
+              `[linkedin-callback] User ${userId} (${userPlan}) at UNIQUE limit ${uniqueCount}/${planLimits.maxAccounts} — rejecting NEW account ${memberId}`
+            )
+            return NextResponse.redirect(new URL('/?linkedin=limit', getAppBaseUrl()))
+          }
+        }
+      }
+
+      await db.linkedinAccount.create({
+        data: {
+          userId,
+          linkedinMemberId: memberId,
+          accountName: memberName,
+          accessToken: encryptedToken,
+          refreshToken: encryptedRefresh,
+          tokenExpiresAt,
+        },
+      })
+    }
 
     // ─── Append to connection log (anti-cycling audit trail) ───────
     // This is NEVER deleted — even if the user disconnects the account

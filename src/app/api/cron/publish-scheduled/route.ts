@@ -1,48 +1,43 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { publishToLinkedIn } from '@/lib/linkedin-publish'
+import { linkedinPostQueue } from '@/lib/queue'
 
 /**
- * Cron endpoint — picks up all posts whose scheduled publish time has arrived
- * and actually publishes them to LinkedIn.
+ * Cron endpoint — SCHEDULE RECOVERY, not a publisher (Bug #3 fix).
+ *
+ * ⚠️ This route used to publish posts DIRECTLY to LinkedIn. That was one of
+ * THREE publish paths (BullMQ worker, this cron, manual publish) and only
+ * the worker had a rate limiter — so a cron + worker deployment burned
+ * LinkedIn quota TWICE as fast and even double-published the same post
+ * (the worker's rate-limited wait never flipped the post to 'processing',
+ * so this cron picked the same due post up again 60s later).
+ *
+ * Now this endpoint NEVER calls LinkedIn. It only:
+ *   1. Resets posts stuck in 'processing' for > 10 minutes (a worker died
+ *      mid-job) back to 'scheduled' so they can be retried.
+ *   2. Finds due posts (scheduled/pending, publishTime <= now) and makes
+ *      sure each one HAS a live BullMQ job — re-queueing any that don't
+ *      (worker was down at the scheduled time, queue was flushed, etc.).
+ *      The worker then publishes them — through the single rate-limited,
+ *      budget-checked, atomic-claim path.
+ *
+ * Duplicate jobs are harmless: the worker claims a post with one atomic
+ * conditional UPDATE, so whichever job runs first wins and the other
+ * no-ops. It is therefore safe to run this cron alongside the workers.
  *
  * Triggered every 60 seconds by:
- *   - The in-container worker loop (see scripts/worker.js) — no external dependency
- *   - OR Coolify's "Cron Jobs" feature calling this endpoint with curl
+ *   - Coolify's "Cron Jobs" feature calling this endpoint with curl
+ *   - OR any external scheduler you prefer
  *
  * Auth: requires `CRON_SECRET` env var. The caller must send either
  *        `Authorization: Bearer <CRON_SECRET>` or `?secret=<CRON_SECRET>`.
- *
- * Idempotency: only posts with status='scheduled' AND publishTime <= now are
- *              picked up. Once processed, status becomes 'published' or 'failed'.
- *              Safe to call multiple times — already-published posts are skipped.
- *
- * Schedule state awareness (NEW):
- *   - CsvUpload.scheduleState can be 'active' | 'paused' | 'off'
- *   - When 'paused' OR 'off', the post's publishTime is temporarily
- *     postponed (rescheduled to the next 60-second slot) so the cron can
- *     pick it back up later without losing its position in the queue.
- *   - This means the scheduler will naturally "resume" when the user
- *     sets scheduleState back to 'active' — no extra logic needed.
- *
- * Concurrency: processes at most 25 posts per call to avoid overwhelming
- *              LinkedIn's rate limit. The worker calls this endpoint every
- *              60s, so a steady-state queue of up to ~1500 posts/hour works.
- *
- * Multi-day auto-continuation (NEW):
- *   - The bulk upload route already assigns publishTimes spanning multiple
- *     days if the CSV has >50 posts (since the daily cap is 50/account/day).
- *   - The cron simply picks up any post whose publishTime has arrived —
- *     so multi-day continuation is automatic.
- *   - When a user pauses the schedule, the cron reschedules pending posts
- *     forward in time so they don't all fire at once when resumed.
  */
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
-const BATCH_SIZE = 25
-const PER_POST_TIMEOUT_MS = 30000
+const BATCH_SIZE = 100
+const STUCK_PROCESSING_MS = 10 * 60 * 1000 // 10 minutes
 
 function authenticate(request: NextRequest): boolean {
   const secret = process.env.CRON_SECRET
@@ -62,43 +57,50 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  return runScheduledPublisher()
+  return runScheduledRecovery()
 }
 
 export async function GET(request: NextRequest) {
   if (!authenticate(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  return runScheduledPublisher()
+  return runScheduledRecovery()
 }
 
-async function runScheduledPublisher() {
+async function runScheduledRecovery() {
   const startedAt = new Date()
   const now = new Date()
 
-  // Find scheduled posts that are due.
-  // FIX: PostStatus enum values are UPPERCASE — lowercase strings crashed
-  // Prisma validation (500) on every cron invocation.
+  // ─── 1) Un-stick posts abandoned in 'processing' ──────────────────
+  // A worker crash / hard kill mid-publish leaves the row in 'processing'
+  // forever. Anything older than 10 minutes is definitely dead (a live
+  // publish can't run longer than the 240s job timeout), so put it back
+  // to 'scheduled' and let the due-posts pass re-queue it below.
+  const resetStuck = await db.post.updateMany({
+    where: {
+      status: 'processing',
+      updatedAt: { lt: new Date(now.getTime() - STUCK_PROCESSING_MS) },
+    },
+    data: { status: 'scheduled' },
+  })
+
+  // ─── 2) Find due posts that need a live queue job ─────────────────
   const duePosts = await db.post.findMany({
     where: {
       status: { in: ['scheduled', 'pending'] },
       publishTime: { lte: now },
     },
     include: {
-      account: {
-        select: {
-          id: true,
-          accessToken: true,
-          refreshToken: true,
-          linkedinMemberId: true,
-          accountName: true,
-          isActive: true,
-        },
-      },
       csvUpload: {
         select: {
           id: true,
           scheduleState: true,
+        },
+      },
+      account: {
+        select: {
+          id: true,
+          isActive: true,
         },
       },
     },
@@ -106,35 +108,18 @@ async function runScheduledPublisher() {
     take: BATCH_SIZE,
   })
 
-  if (duePosts.length === 0) {
-    return NextResponse.json({
-      status: 'idle',
-      processed: 0,
-      published: 0,
-      failed: 0,
-      paused: 0,
-      startedAt: startedAt.toISOString(),
-      durationMs: Date.now() - startedAt.getTime(),
-    })
-  }
-
-  let published = 0
-  let failed = 0
+  let requeued = 0
+  let alreadyQueued = 0
   let paused = 0
-  const errors: Array<{ postId: string; error: string }> = []
+  let deactivated = 0
 
-  // Process sequentially to avoid hammering LinkedIn with parallel requests
   for (const post of duePosts) {
     // ─── Schedule-state awareness ───────────────────────────────────
     // If the parent CSV upload's schedule is paused or off, push this
-    // post's publishTime forward so the cron picks it back up later.
-    // This naturally implements "Pause" / "Resume" / "On / Off".
+    // post's publishTime forward so it is picked back up later. This
+    // naturally implements "Pause" / "Resume" / "On / Off".
     const scheduleState = post.csvUpload?.scheduleState || 'active'
     if (scheduleState !== 'active') {
-      // Reschedule to ~5 min from now (so it gets re-checked periodically),
-      // but only if it would otherwise have fired (i.e., publishTime <= now).
-      // The 5-min spacing also prevents the cron from hot-looping on this
-      // same post every 60 seconds while paused.
       const newTime = new Date(now.getTime() + 5 * 60 * 1000)
       await db.post.update({
         where: { id: post.id },
@@ -152,69 +137,62 @@ async function runScheduledPublisher() {
           error: 'LinkedIn account is deactivated',
         },
       })
-      failed++
-      errors.push({ postId: post.id, error: 'Account deactivated' })
+      deactivated++
       continue
     }
 
     try {
-      // Race against a per-post timeout so one slow LinkedIn response
-      // can't stall the whole batch.
-      const result = await Promise.race([
-        publishToLinkedIn(
-          post.account.accessToken,
-          post.account.linkedinMemberId,
-          post.caption,
-          post.imageUrl,
-          post.videoUrl,
-          post.userId,
-          post.account.id
-        ),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error('Publish timeout — LinkedIn did not respond in time')),
-            PER_POST_TIMEOUT_MS
-          )
-        ),
-      ])
+      // Is there already a live (waiting/delayed/active) job for this post?
+      // The base jobId is the one used by bulk upload / single-post create.
+      const baseJobId = `post-${post.id}-${post.publishTime?.getTime() ?? 0}`
+      const existingJob = await linkedinPostQueue.getJob(baseJobId)
+      if (existingJob) {
+        const [completed, failed] = await Promise.all([
+          existingJob.isCompleted(),
+          existingJob.isFailed(),
+        ])
+        if (!completed && !failed) {
+          // Job still live in the queue — the worker will handle it.
+          alreadyQueued++
+          continue
+        }
+      }
 
-      // Persist the LinkedIn post URN
-      await db.post.update({
-        where: { id: post.id },
-        data: {
-          status: 'published',
-          error: null,
-          linkedinPostUrn: result.postUrn,
+      // No live job → (re-)queue with a fresh recover jobId so it can't
+      // collide with a stale failed job holding the base id. If a live
+      // duplicate slips through anyway, the worker's atomic claim makes
+      // it a harmless no-op.
+      await linkedinPostQueue.add(
+        'publish-linkedin-post',
+        {
+          postId: post.id,
+          userId: post.userId,
+          scheduledAt: post.publishTime ?? now,
         },
-      })
-      published++
-
-      // Note: auto-commenting is intentionally NOT implemented — it
-      // requires LinkedIn's Community Management API product access,
-      // which this app does not have. Every attempt returns 404
-      // regardless of URN format or endpoint used.
+        {
+          jobId: `post-${post.id}-recover-${now.getTime()}`,
+          delay: 0,
+          priority: 1,
+        }
+      )
+      requeued++
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      await db.post.update({
-        where: { id: post.id },
-        data: {
-          status: 'failed',
-          error: errorMessage.slice(0, 500),
-        },
-      })
-      failed++
-      errors.push({ postId: post.id, error: errorMessage })
+      // Queue unreachable — post stays 'scheduled'; next cron tick retries.
+      console.error(`[cron-recovery] Failed to re-queue post ${post.id}:`, err)
     }
   }
 
   return NextResponse.json({
-    status: 'processed',
+    status: requeued > 0 || resetStuck.count > 0 ? 'processed' : 'idle',
     processed: duePosts.length,
-    published,
-    failed,
+    requeued,
+    alreadyQueued,
     paused,
+    deactivated,
+    resetStuck: resetStuck.count,
+    published: 0, // publishing is the worker's job now — kept for old clients
+    failed: deactivated,
     startedAt: startedAt.toISOString(),
     durationMs: Date.now() - startedAt.getTime(),
-    errors: errors.slice(0, 10), // cap to keep response small
   })
 }

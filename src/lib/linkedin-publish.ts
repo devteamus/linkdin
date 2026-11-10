@@ -23,10 +23,47 @@
  *
  * Reference: https://learn.microsoft.com/linkedin/marketing/integrations/community-management/shares/ugc-post-api
  *            https://learn.microsoft.com/linkedin/marketing/integrations/community-management/shares/posts-api
+ *
+ * ─── RATE LIMITING (Bugs #1–#6 fixes) ────────────────────────────────────
+ *
+ * EVERY call to api.linkedin.com goes through linkedinRestFetch() below,
+ * which enforces — no matter which path triggers it (BullMQ worker,
+ * cron, manual "Publish Now"):
+ *
+ *   a) PER-MEMBER sliding-window throttle (Redis, atomic Lua) keyed by
+ *      linkedinMemberId — LinkedIn throttles per member identity, so this
+ *      mirrors their view. A publish with image = 2 REST calls, video = 3+
+ *      REST calls — each call acquires its own slot (Bug #4: previously
+ *      the limiter counted 1 "job" and let 2-3x the real call volume out).
+ *
+ *   b) The plan's per-account 24h API budget (Free/Pro 150, Enterprise
+ *      500) checked against ApiUsageLog BEFORE the call is made (Bug #5:
+ *      the limit was documented as "enforced" but nothing ever enforced
+ *      it — the worker limiter alone allowed thousands of calls per day).
+ *
+ *   c) LinkedIn 429 responses are honored: we read their Retry-After
+ *      header, wait (bounded), and retry ONCE in-flight. If still
+ *      throttled we throw an error that explicitly contains "429" so the
+ *      worker's retry classifier treats it as rate-limit (Bug #6: the old
+ *      message "LinkedIn rate limit hit…" contained no "429", fell into
+ *      the default-retriable bucket, and was retried after just 5s —
+ *      deepening the throttle and burning the post's 3 attempts).
+ *
+ *   d) 401/403 messages now include the words "Unauthorized"/"Forbidden"
+ *      so the worker classifies them PERMANENT instead of retrying a
+ *      dead token 3 times.
  */
 
 import { decryptToken } from './encryption'
 import { db } from './db'
+import {
+  acquireMemberSlotWithWait,
+  LINKEDIN_RATE_LIMIT_MAX,
+  LINKEDIN_RATE_LIMIT_WINDOW_MS,
+} from './linkedin-rate-limiter'
+import { getPlanLimits } from './plan-limits'
+import { getEffectivePlan } from './plan-helpers'
+import type { Plan } from '@prisma/client'
 
 const LINKEDIN_VERSION = '202607'
 
@@ -54,6 +91,134 @@ async function logApiCall(
     // Non-fatal — just log to console
     console.warn('[api-usage] Failed to log API call:', err)
   }
+}
+
+// ─── Bug #5: enforce the plan's per-account 24h API call budget ─────
+
+/**
+ * Throws BEFORE the LinkedIn call is made when the account has already
+ * consumed its plan's per-account API budget in the last 24h.
+ *
+ * The thrown message deliberately contains "daily API budget exhausted"
+ * which the worker classifies as a PERMANENT error (no pointless retries).
+ */
+async function enforceDailyApiBudget(
+  userId: string,
+  accountId: string | undefined
+): Promise<void> {
+  if (!userId) return
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    const used = await db.apiUsageLog.count({
+      where: {
+        userId,
+        ...(accountId ? { accountId } : {}),
+        createdAt: { gte: since },
+      },
+    })
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { plan: true, planExpiresAt: true },
+    })
+    const rawPlan = (user?.plan as Plan) || 'free'
+    const effectivePlan = getEffectivePlan(rawPlan, user?.planExpiresAt ?? null)
+    const limit = getPlanLimits(effectivePlan).maxApiCallsPerDay
+
+    if (used >= limit) {
+      throw new Error(
+        `Daily LinkedIn API budget exhausted for this account: ${used}/${limit} calls in the last 24h ` +
+        `(${effectivePlan} plan). Posting automatically resumes when the oldest calls in the 24h window expire — ` +
+        'no action needed, do not retry.'
+      )
+    }
+  } catch (err) {
+    // Re-throw OUR limit error; swallow infrastructure errors (a broken
+    // usage counter must never block publishing).
+    if (err instanceof Error && err.message.includes('Daily LinkedIn API budget exhausted')) {
+      throw err
+    }
+    console.warn('[api-usage] Could not verify daily budget (continuing):', err)
+  }
+}
+
+// ─── Bug #2/#4/#6: rate-limited LinkedIn REST fetch wrapper ─────────
+
+interface LinkedInCallContext {
+  /** LinkedIn member id — the identity LinkedIn throttles by (Bug #1) */
+  memberId: string
+  userId: string
+  accountId: string
+  endpoint: string
+  method: string
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Parse LinkedIn's Retry-After header (seconds) into a bounded wait. */
+function parseRetryAfterSeconds(res: Response): number {
+  const raw = parseInt(res.headers.get('retry-after') || '', 10)
+  if (!Number.isFinite(raw) || raw <= 0) return 60
+  return Math.min(raw, 120) // cap: never sleep longer than 2 minutes in-flight
+}
+
+/**
+ * Makes ONE logical LinkedIn REST API call:
+ *   1. enforce the per-account 24h budget (Bug #5)
+ *   2. acquire a per-member throttle slot, waiting + re-checking if the
+ *      member's window is saturated (Bugs #1, #2, #4)
+ *   3. fetch, with a fresh AbortSignal.timeout per attempt
+ *   4. log the call to ApiUsageLog
+ *   5. on 429: honor Retry-After, retry once (Bug #6)
+ */
+async function linkedinRestFetch(
+  ctx: LinkedInCallContext,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  await enforceDailyApiBudget(ctx.userId, ctx.accountId)
+
+  const doAttempt = async (): Promise<Response> => {
+    const decision = await acquireMemberSlotWithWait(ctx.memberId, { maxWaitMs: 60_000 })
+    if (!decision.allowed) {
+      throw new Error(
+        `LinkedIn per-member rate limit still saturated after 60s of waiting (429 backpressure, ` +
+        `${decision.used}/${LINKEDIN_RATE_LIMIT_MAX} calls in the last ` +
+        `${LINKEDIN_RATE_LIMIT_WINDOW_MS / 1000}s window) — backing off, will retry later`
+      )
+    }
+    return fetch(url, {
+      ...init,
+      // Fresh signal per attempt so a Retry-After wait doesn't eat the budget
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  }
+
+  let res = await doAttempt()
+  await logApiCall(ctx.userId, ctx.accountId, ctx.endpoint, ctx.method, res.status)
+
+  if (res.status === 429) {
+    const retryAfterSec = parseRetryAfterSeconds(res)
+    console.warn(
+      `[linkedin] 429 rate limit on ${ctx.endpoint} — honoring Retry-After: ${retryAfterSec}s, retrying once`
+    )
+    await sleep(retryAfterSec * 1000)
+
+    res = await doAttempt()
+    await logApiCall(ctx.userId, ctx.accountId, ctx.endpoint, ctx.method, res.status)
+
+    if (res.status === 429) {
+      throw new Error(
+        `LinkedIn API 429 rate limit hit — waited ${retryAfterSec}s (Retry-After) and still throttled. ` +
+        'Job will retry with backoff; the per-member window needs time to drain.'
+      )
+    }
+  }
+
+  return res
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
@@ -102,24 +267,27 @@ async function isVideoContent(url: string): Promise<boolean> {
 async function uploadImageToLinkedIn(
   accessToken: string,
   authorUrn: string,
+  authorMemberId: string,
   imageUrl: string,
   userId: string,
   accountId: string
 ): Promise<string> {
   // Step 1: ask LinkedIn to initialize an upload slot for this owner.
-  const initRes = await fetch('https://api.linkedin.com/rest/images?action=initializeUpload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'X-Restli-Protocol-Version': '2.0.0',
-      'LinkedIn-Version': LINKEDIN_VERSION,
+  const initRes = await linkedinRestFetch(
+    { memberId: authorMemberId, userId, accountId, endpoint: '/rest/images?action=initializeUpload', method: 'POST' },
+    'https://api.linkedin.com/rest/images?action=initializeUpload',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-Restli-Protocol-Version': '2.0.0',
+        'LinkedIn-Version': LINKEDIN_VERSION,
+      },
+      body: JSON.stringify({ initializeUploadRequest: { owner: authorUrn } }),
     },
-    body: JSON.stringify({ initializeUploadRequest: { owner: authorUrn } }),
-    signal: AbortSignal.timeout(15000),
-  })
-
-  await logApiCall(userId, accountId, '/rest/images?action=initializeUpload', 'POST', initRes.status)
+    15000
+  )
 
   if (!initRes.ok) {
     const errText = await initRes.text().catch(() => '')
@@ -161,16 +329,15 @@ async function uploadImageToLinkedIn(
   }
 
   // Step 3: PUT the raw binary to LinkedIn's pre-signed upload URL.
+  // PUT to the upload URL is against a pre-signed S3-style URL, not the
+  // LinkedIn API itself — not logged / not rate-limited (by design, to
+  // avoid over-counting).
   const putRes = await fetch(uploadUrl, {
     method: 'PUT',
     headers: { 'Authorization': `Bearer ${accessToken}` },
     body: new Uint8Array(imageBuffer),
     signal: AbortSignal.timeout(60000),
   })
-
-  // PUT to the upload URL is technically a LinkedIn API call too,
-  // but it's against a pre-signed S3-style URL, not the LinkedIn API itself.
-  // We do not log it to ApiUsageLog to avoid over-counting.
 
   if (!putRes.ok) {
     throw new Error(`LinkedIn image binary upload failed (HTTP ${putRes.status})`)
@@ -187,14 +354,15 @@ async function uploadImageToLinkedIn(
  *
  * LinkedIn's video upload is a 3-step process:
  *   1. initializeUpload (returns upload URL + video URN + upload token)
- *   2. PUT binary to the upload URL
- *   3. (Optional) finalizeUpload — LinkedIn recommends this for videos
+ *   2. PUT binary to the upload URL (possibly multiple parts)
+ *   3. finalizeUpload — REQUIRED for multi-part video
  *
  * Reference: https://learn.microsoft.com/linkedin/marketing/integrations/community-management/shares/videos-and-live-video
  */
 async function uploadVideoToLinkedIn(
   accessToken: string,
   authorUrn: string,
+  authorMemberId: string,
   videoUrl: string,
   userId: string,
   accountId: string
@@ -228,26 +396,28 @@ async function uploadVideoToLinkedIn(
   }
 
   // Step 2: initialize the upload slot, declaring the exact file size.
-  const initRes = await fetch('https://api.linkedin.com/rest/videos?action=initializeUpload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'X-Restli-Protocol-Version': '2.0.0',
-      'LinkedIn-Version': LINKEDIN_VERSION,
-    },
-    body: JSON.stringify({
-      initializeUploadRequest: {
-        owner: authorUrn,
-        fileSizeBytes: videoBuffer.byteLength,
-        uploadCaptions: false,
-        uploadThumbnail: false,
+  const initRes = await linkedinRestFetch(
+    { memberId: authorMemberId, userId, accountId, endpoint: '/rest/videos?action=initializeUpload', method: 'POST' },
+    'https://api.linkedin.com/rest/videos?action=initializeUpload',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-Restli-Protocol-Version': '2.0.0',
+        'LinkedIn-Version': LINKEDIN_VERSION,
       },
-    }),
-    signal: AbortSignal.timeout(15000),
-  })
-
-  await logApiCall(userId, accountId, '/rest/videos?action=initializeUpload', 'POST', initRes.status)
+      body: JSON.stringify({
+        initializeUploadRequest: {
+          owner: authorUrn,
+          fileSizeBytes: videoBuffer.byteLength,
+          uploadCaptions: false,
+          uploadThumbnail: false,
+        },
+      }),
+    },
+    15000
+  )
 
   if (!initRes.ok) {
     const errText = await initRes.text().catch(() => '')
@@ -268,9 +438,9 @@ async function uploadVideoToLinkedIn(
 
   // Step 3: LinkedIn splits large videos into multiple ~4MB parts, each
   // with its own byte range and its own pre-signed upload URL. Every part
-  // must be PUT separately, and every part's response ETag header must be
-  // collected — finalizeUpload needs them all, in order, to stitch the
-  // video back together.
+  // must be PUT separately (pre-signed URLs — not the LinkedIn REST API,
+  // so not rate-limit-counted), and every part's response ETag header must
+  // be collected — finalizeUpload needs them all, in order.
   const partIds: string[] = []
   for (const part of uploadInstructions) {
     const chunk = videoBuffer.subarray(part.firstByte, part.lastByte + 1)
@@ -302,25 +472,27 @@ async function uploadVideoToLinkedIn(
   // video. Without a successful finalize call carrying the correct
   // uploadedPartIds, the video never leaves "processing" and can't be
   // attached to a post.
-  const finalizeRes = await fetch('https://api.linkedin.com/rest/videos?action=finalizeUpload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'X-Restli-Protocol-Version': '2.0.0',
-      'LinkedIn-Version': LINKEDIN_VERSION,
-    },
-    body: JSON.stringify({
-      finalizeUploadRequest: {
-        video: videoUrn,
-        uploadToken,
-        uploadedPartIds: partIds,
+  const finalizeRes = await linkedinRestFetch(
+    { memberId: authorMemberId, userId, accountId, endpoint: '/rest/videos?action=finalizeUpload', method: 'POST' },
+    'https://api.linkedin.com/rest/videos?action=finalizeUpload',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-Restli-Protocol-Version': '2.0.0',
+        'LinkedIn-Version': LINKEDIN_VERSION,
       },
-    }),
-    signal: AbortSignal.timeout(15000),
-  })
-
-  await logApiCall(userId, accountId, '/rest/videos?action=finalizeUpload', 'POST', finalizeRes.status)
+      body: JSON.stringify({
+        finalizeUploadRequest: {
+          video: videoUrn,
+          uploadToken,
+          uploadedPartIds: partIds,
+        },
+      }),
+    },
+    15000
+  )
 
   if (!finalizeRes.ok) {
     const errText = await finalizeRes.text().catch(() => '')
@@ -350,6 +522,11 @@ export interface LinkedInPostResult {
 
 /**
  * Publish a text + optional image/video post to LinkedIn on behalf of a member.
+ *
+ * Every LinkedIn REST call inside (media initialize/finalize + the posts
+ * call itself) goes through linkedinRestFetch(), which rate-limits per
+ * LinkedIn member id, enforces the plan's 24h budget, and honors 429
+ * Retry-After — for EVERY caller (worker / cron / manual publish).
  *
  * @param encryptedAccessToken  The encrypted token stored in DB
  * @param authorMemberId        The LinkedIn member ID (linkedinMemberId column)
@@ -384,6 +561,13 @@ export async function publishToLinkedIn(
   // LinkedIn author URN. The REST Posts API uses urn:li:person:<id>
   const authorUrn = `urn:li:person:${authorMemberId}`
 
+  // Context shared by every rate-limited call in this publish
+  const callCtx = {
+    memberId: authorMemberId,
+    userId: userId || '',
+    accountId: accountId || '',
+  }
+
   // Build the post body for the REST Posts API
   const postBody: Record<string, unknown> = {
     author: authorUrn,
@@ -403,7 +587,10 @@ export async function publishToLinkedIn(
   const effectiveImageUrl = imageUrl?.trim() || undefined
 
   if (effectiveVideoUrl) {
-    const vidUrn = await uploadVideoToLinkedIn(accessToken, authorUrn, effectiveVideoUrl, userId || '', accountId || '')
+    const vidUrn = await uploadVideoToLinkedIn(
+      accessToken, authorUrn, authorMemberId, effectiveVideoUrl,
+      callCtx.userId, callCtx.accountId
+    )
     postBody.content = {
       media: {
         title: caption.slice(0, 120) || 'Video',
@@ -411,7 +598,10 @@ export async function publishToLinkedIn(
       },
     }
   } else if (effectiveImageUrl) {
-    const imgUrn = await uploadImageToLinkedIn(accessToken, authorUrn, effectiveImageUrl, userId || '', accountId || '')
+    const imgUrn = await uploadImageToLinkedIn(
+      accessToken, authorUrn, authorMemberId, effectiveImageUrl,
+      callCtx.userId, callCtx.accountId
+    )
     postBody.content = {
       media: {
         title: caption.slice(0, 120) || 'Post',
@@ -420,21 +610,22 @@ export async function publishToLinkedIn(
     }
   }
 
-  // Call the REST Posts API
-  const response = await fetch('https://api.linkedin.com/rest/posts', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'X-Restli-Protocol-Version': '2.0.0',
-      'LinkedIn-Version': LINKEDIN_VERSION,
+  // Call the REST Posts API (rate-limited + budget-checked + 429-aware)
+  const response = await linkedinRestFetch(
+    { ...callCtx, endpoint: '/rest/posts', method: 'POST' },
+    'https://api.linkedin.com/rest/posts',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-Restli-Protocol-Version': '2.0.0',
+        'LinkedIn-Version': LINKEDIN_VERSION,
+      },
+      body: JSON.stringify(postBody),
     },
-    body: JSON.stringify(postBody),
-  })
-
-  if (userId) {
-    await logApiCall(userId, accountId, '/rest/posts', 'POST', response.status)
-  }
+    30000
+  )
 
   if (!response.ok) {
     const errText = await response.text().catch(() => '')
@@ -446,19 +637,24 @@ export async function publishToLinkedIn(
       if (errText) errorMessage += `: ${errText.slice(0, 200)}`
     }
 
-    // Friendly error mapping
+    // Friendly error mapping. Messages intentionally contain the exact
+    // keyword the worker's isRetriableErrorType() matches on, so a dead
+    // token is NEVER retried and a rate limit ALWAYS is (Bug #6).
     if (response.status === 401) {
       throw new Error(
-        'LinkedIn token is invalid or expired. Please refresh the access token for this account.'
+        'LinkedIn token is invalid or expired (401 Unauthorized) — please refresh the access token for this account.'
       )
     }
     if (response.status === 403) {
       throw new Error(
-        'LinkedIn rejected the post (insufficient scope or rate limit). Ensure the account was connected with w_member_social scope.'
+        'LinkedIn rejected the post — insufficient scope (403 Forbidden). Ensure the account was connected with w_member_social scope.'
       )
     }
     if (response.status === 429) {
-      throw new Error('LinkedIn rate limit hit. Try again in a few minutes.')
+      // (Normally handled inside linkedinRestFetch; kept as a safety net.)
+      throw new Error(
+        'LinkedIn API 429 rate limit hit — too many requests. Backing off and retrying later.'
+      )
     }
     throw new Error(errorMessage)
   }

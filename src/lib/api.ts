@@ -161,6 +161,15 @@ export const api = {
   deleteCsvUpload: (id: string) =>
     request<{ success: boolean }>(`/csv-uploads/${id}`, { method: 'DELETE' }),
 
+  // Account-wise history (NEW — Account History tab)
+  getAccountHistory: (accountId: string) =>
+    request<AccountHistoryResponse>(`/accounts/${accountId}/history`),
+
+  getAccountHistoryPosts: (accountId: string, uploadId: string) =>
+    request<AccountHistoryPostsResponse>(
+      `/accounts/${accountId}/history?uploadId=${encodeURIComponent(uploadId)}`
+    ),
+
   // Admin
   getAdminStats: () =>
     request<AdminStats>('/admin/stats'),
@@ -422,4 +431,75 @@ export interface CsvUploadSummary {
     pending: number;
     failed: number;
   };
+}
+
+// ——— Account-wise history (Account History tab) —————————————
+
+export interface AccountHistoryResponse {
+  account: {
+    id: string;
+    accountName: string;
+    linkedinMemberId: string;
+    isActive: boolean;
+    createdAt: string;
+  };
+  totals: {
+    published: number;
+    scheduled: number;
+    pending: number;
+    processing: number;
+    failed: number;
+  };
+  nextPost: {
+    id: string;
+    publishTime: string | null;
+    captionPreview: string;
+    uploadId: string | null;
+  } | null;
+  uploads: AccountHistoryUpload[];
+}
+
+export interface AccountHistoryUpload {
+  id: string;
+  filename: string;
+  totalPosts: number;
+  intervalValue: number;
+  intervalUnit: string;
+  scheduleState: string;
+  createdAt: string;
+  counts: {
+    published: number;
+    scheduled: number;
+    pending: number;
+    processing: number;
+    failed: number;
+  };
+  firstPublishAt: string | null;
+  lastPublishAt: string | null;
+  nextPublishAt: string | null;
+}
+
+export interface AccountHistoryPost {
+  id: string;
+  serial: number;
+  status: string;
+  publishTime: string | null;
+  error: string | null;
+  linkedinPostUrn: string | null;
+  retryCount: number;
+  createdAt: string;
+  captionPreview: string;
+}
+
+export interface AccountHistoryPostsResponse {
+  upload: {
+    id: string;
+    filename: string;
+    totalPosts: number;
+    intervalValue: number;
+    intervalUnit: string;
+    scheduleState: string;
+    createdAt: string;
+  };
+  posts: AccountHistoryPost[];
 }

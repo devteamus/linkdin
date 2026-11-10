@@ -338,32 +338,41 @@ export async function POST(request: NextRequest) {
       }))
 
       // Bulk insert all posts in a single database round-trip
-      let createdPostIds: string[] = []
-      
+      // + fetch back the created rows in CSV SERIAL order.
+      //
+      // ⚠️ CSV-SERIAL CRITICAL FIX: the old fetch-back ordered by
+      // `createdAt` — but createMany() writes every row in ONE SQL statement,
+      // so Postgres assigns ALL rows the same statement timestamp and
+      // createdAt ordering is arbitrary. The queue then paired job IDs with
+      // the WRONG publishTime (post #500 of a 1000-row CSV could fire at row
+      // #3's slot), silently breaking the CSV serial order. `publishTime` is
+      // assigned strictly in CSV row order (row 1 → first slot, row 2 → next
+      // interval slot, …), so ordering by publishTime IS the CSV serial
+      // order — the same order the Account History tab displays.
+      let createdRows: Array<{ id: string; publishTime: Date | null }> = []
+
       if (postsToCreate.length > 0) {
         // createMany is significantly faster than individual inserts
         const createResult = await db.post.createMany({
           data: postsToCreate,
           skipDuplicates: true, // Skip if same postId somehow exists
         })
-        
+
         console.log(
           `[bulk] Created ${createResult.count} posts for user ${userId} ` +
           `(CSV: ${file.name}, Account: ${account.accountName})`
         )
 
-        // Fetch the created post IDs (needed for queue operations)
-        // We query them back since createMany doesn't return the full objects
-        createdPostIds = (
-          await db.post.findMany({
-            where: {
-              csvUploadId: csvUpload.id,
-              status: 'scheduled',
-            },
-            select: { id: true },
-            orderBy: { createdAt: 'asc' },
-          })
-        ).map(p => p.id)
+        // Fetch the created rows back (needed for queue operations), in
+        // strict CSV serial order (publishTime ascending).
+        createdRows = await db.post.findMany({
+          where: {
+            csvUploadId: csvUpload.id,
+            status: 'scheduled',
+          },
+          select: { id: true, publishTime: true },
+          orderBy: [{ publishTime: 'asc' }, { id: 'asc' }],
+        })
       }
 
       // ─── PUSH TO BULLMQ QUEUE (Async — Non-Blocking!) ────────
@@ -382,13 +391,17 @@ export async function POST(request: NextRequest) {
 
       let queuedCount = 0
       let queueError: string | null = null
-      
-      if (createdPostIds.length > 0) {
-        // Prepare queue entries
-        const queueEntries = createdPostIds.map((postId, i) => ({
-          postId,
+
+      if (createdRows.length > 0) {
+        // Prepare queue entries from EACH post's own stored publishTime —
+        // not by index pairing. This guarantees the BullMQ job for CSV row N
+        // fires exactly at row N's slot: the CSV serial order is maintained
+        // end-to-end, and the Account History tab's serial numbers match what
+        // actually publishes.
+        const queueEntries = createdRows.map((row) => ({
+          postId: row.id,
           userId,
-          scheduledAt: publishTimes[i],
+          scheduledAt: row.publishTime ?? publishTimes[publishTimes.length - 1],
         }))
 
         // Fire-and-forget: Add to queue but don't block the response
@@ -400,10 +413,10 @@ export async function POST(request: NextRequest) {
           .catch((err) => {
             queueError = err instanceof Error ? err.message : 'Unknown queue error'
             console.error(`[bulk] ❌ Failed to queue posts for user ${userId}:`, err)
-            
+
             // Posts are still in DB with SCHEDULED status — they won't be lost
             // but they need manual retry or a recovery job to pick them up
-            console.warn(`[bulk] ⚠️ ${createdPostIds.length} posts in SCHEDULED status but not queued`)
+            console.warn(`[bulk] ⚠️ ${createdRows.length} posts in SCHEDULED status but not queued`)
           })
       }
 
@@ -426,8 +439,8 @@ export async function POST(request: NextRequest) {
           interval: `${intervalValue} ${intervalUnit}${intervalValue > 1 ? 's' : ''}`,
         },
         queueInfo: {
-          totalQueued: createdPostIds.length,
-          message: createdPostIds.length > 0 
+          totalQueued: createdRows.length,
+          message: createdRows.length > 0 
             ? 'Posts have been queued for publishing. They will be processed automatically at their scheduled times.'
             : 'No posts were created from this upload.',
           warning: queueError ? `Queue warning: ${queueError}` : undefined,

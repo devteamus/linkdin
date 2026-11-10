@@ -8,8 +8,16 @@ import { PostStatus } from '@prisma/client'
 /**
  * Manually publish a post to LinkedIn NOW (overrides the scheduled time).
  *
- * This is also called internally by the cron worker when a post's
- * scheduled time arrives. Manual publish is for "publish immediately" use cases.
+ * Bug #3 completion — ATOMIC CLAIM: before publishing, the post is claimed
+ * with ONE conditional updateMany (scheduled/pending/failed → processing).
+ * The BullMQ worker uses the exact same claim, so if the post's scheduled
+ * time arrives WHILE the user is clicking "Publish Now" (or vice versa),
+ * exactly one of the two publishers wins and the other gets a 409 — the
+ * same post can never be published twice.
+ *
+ * All rate limiting still applies (it lives inside publishToLinkedIn:
+ * per-member atomic limiter, 24h budget, 429 Retry-After), so this manual
+ * path is fully protected too.
  *
  * Supports the new optional fields:
  *   - videoUrl: publishes as a video post
@@ -64,6 +72,33 @@ export async function POST(
       )
     }
 
+    // ─── ATOMIC CLAIM (Bug #3 completion) ────────────────────────────
+    // Identical to the worker's Step 5: only a post still in
+    // scheduled/pending/failed can be claimed. If the worker already
+    // grabbed it (status = processing) or it was just published, count === 0
+    // and we refuse — worker + manual publish can never double-post a row.
+    const claim = await db.post.updateMany({
+      where: {
+        id,
+        status: { in: [PostStatus.scheduled, PostStatus.pending, PostStatus.failed] },
+      },
+      data: {
+        status: PostStatus.processing,
+        scheduledAt: new Date(),
+      },
+    })
+
+    if (claim.count === 0) {
+      return NextResponse.json(
+        {
+          error:
+            'This post is currently being published by the scheduler (or was just published). ' +
+            'Please refresh and try again in a moment.',
+        },
+        { status: 409 }
+      )
+    }
+
     // Actually call LinkedIn to publish the post
     let postUrn = ''
     try {
@@ -79,7 +114,10 @@ export async function POST(
       postUrn = result.postUrn
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      // Persist the error so the user sees it in the dashboard
+      // Persist the error so the user sees it in the dashboard.
+      // NOTE: this catch can only run AFTER a successful claim above, so the
+      // post is currently 'processing' — setting it back to 'failed' here is
+      // safe (the worker's atomic claim will refuse any racing duplicate job).
       await db.post.update({
         where: { id },
         data: { status: PostStatus.failed, error: errorMessage.slice(0, 500) },
