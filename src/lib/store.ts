@@ -12,6 +12,7 @@ type DashboardTab =
   | 'bulk-post'
   | 'history'
   | 'csv-history'   // NEW — CSV Upload History tab
+  | 'account-history'  // NEW — per-account publish history (uploads + serial + next post)
   | 'upgrade';
 // LandingSection is used for scroll-to-section on the home page
 type LandingSection = 'home' | 'features' | 'pricing' | 'faq';
